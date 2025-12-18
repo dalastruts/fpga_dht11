@@ -1,0 +1,255 @@
+LIBRARY ieee;
+USE ieee.std_logic_1164.ALL;
+USE IEEE.STD_LOGIC_ARITH.ALL;
+USE IEEE.STD_LOGIC_UNSIGNED.ALL;
+ 
+ENTITY project_dht11 IS
+PORT(
+		clk			: in std_logic; -- after clock divider, it's 400 HZ now	
+		reset_n		: in std_logic; -- set'0' will restart, back to idle state
+		data_line1 	: inout std_logic;
+		
+		rs          : out std_logic; --set'1' will send data
+											--'0' will send instruction
+		rw 			: out std_logic; --set'1' will read
+											--'0' will write
+		lcd_enable 	: out std_logic; --set'1' will read data from the bus
+	
+		lcd_on		: out std_logic;
+		lcd_blon    : out std_logic;--back light
+		lcd_data    : out std_logic_vector(7 downto 0)
+		
+
+		);
+END project_dht11; 
+
+ARCHITECTURE Behavioral OF project_dht11 IS
+
+	component lcd_only IS
+	PORT(
+			clk			: in std_logic; -- after clock divider, it's 400 HZ now	
+			reset_n		: in std_logic; -- set'0' will restart, back to idle state
+			humidity    : in std_logic_vector(7 downto 0);
+			temperature : in std_logic_vector(7 downto 0);				
+			rs          : out std_logic; --set'1' will send data
+													--'0' will send instruction
+			rw 			: out std_logic; --set'1' will read
+													--'0' will write
+			lcd_enable 	: out std_logic; --set'1' will read data from the bus			
+			lcd_on		: out std_logic;
+			lcd_blon    : out std_logic;--back light
+			lcd_data    : out std_logic_vector(7 downto 0)	
+		);
+	END component; 
+	
+	component bi2bcd is
+   	Port (
+		binary_in : in std_logic_vector (7 downto 0);
+		bcd_out   : out std_logic_vector (7 downto 0)
+	);
+	end component;
+
+	
+	
+	component clk_div_2 is
+	port ( 
+			clk      : in std_logic;       -- 50M HZ
+			clock_out: out std_logic;		 -- 400 HZ for LCD
+			clock_out_dht11: out std_logic -- 400K HZ for DHT11 sensor
+		);
+	end component;
+	
+	signal clk_1 : std_logic;
+	signal clk_dht11 : std_logic;
+	
+	signal humidity : std_logic_vector(7 downto 0);
+	signal temperature : std_logic_vector(7 downto 0);	
+	
+	signal humidity_bcd : std_logic_vector(7 downto 0);
+	signal temperature_bcd : std_logic_vector(7 downto 0);	
+	
+	
+	
+	type dht_control is ( initial, master_call,master_wait, slave_response, slave_prepare,
+								 data_begin, data_read, data_end);
+	signal state : dht_control;
+
+	signal cnt : integer range 0 to 399999 := 0;
+	signal data_bit : integer range 40 downto 0;
+	signal data_get : std_logic_vector(39 downto 0) := (others => '0'); -- Initializing all bits to '0'
+	signal tmp_get : std_logic_vector(39 downto 0) := (others => '0');
+
+	signal humidity_tmp : std_logic_vector(7 downto 0) := (others => '0');
+	signal temperature_tmp : std_logic_vector(7 downto 0) := (others => '0');
+	
+	signal pre_signal : std_logic;  -- store the voltage of the dataline before 
+	signal pre_signal_temp : std_logic;  -- store the voltage of the dataline before 
+	signal en_signal : std_logic;   -- for the inout buffer data_line, set it input or output
+	signal in_signal : std_logic;   -- I cannot assign value to data_line("multiple constant drivers"),
+											  -- instead, I need this take enable signal from data_line
+	
+	constant clk_period : time := 2.5 us; -- input clk 400kHZ
+	constant delay_18_ms : integer := 7199; -- 18*10e-3 / 2.5*10e-6
+	constant delay_40_us : integer := 15;	-- 40*10e-6 / 2.5*10e-6
+	constant delay_50_us : integer := 19;
+	constant delay_80_us : integer := 31;
+	constant delay_20_us : integer := 7;
+	constant data_bit_40 : integer := 40;
+
+	signal dataline_ctr : std_logic_vector(1 downto 0);
+	signal data_line_buffer : std_logic;
+	signal ctr_2 : std_logic;
+	
+begin
+	
+	uo: clk_div_2 port map(clk, clk_1, clk_dht11);
+	
+	u2: bi2bcd port map (humidity,humidity_bcd);
+	u3: bi2bcd port map (temperature,temperature_bcd);
+	
+	u4: lcd_only port map(clk_1,reset_n, humidity_bcd,temperature_bcd, rs,rw,lcd_enable ,lcd_on,lcd_blon,lcd_data);
+	
+	process(clk_dht11)
+	begin
+		if (reset_n = '0') then
+			pre_signal_temp <= '0';
+		else
+			if(clk_dht11'EVENT and clk_dht11 = '1') then	
+				pre_signal_temp <= pre_signal;
+			end if;
+		end if;
+	end process;
+
+	process(clk_dht11,state,cnt,pre_signal_temp,pre_signal)
+	begin
+		
+		if(reset_n = '0') then
+			cnt <= 0;
+			data_get <= (others => '0');
+			state <= initial;			
+		elsif(clk_dht11'EVENT and clk_dht11 = '1') then			
+			case state is
+				when initial   => 
+					dataline_ctr <= "00";
+					data_bit <= data_bit_40; -- 40 bit
+					state <= master_call;	
+					tmp_get <= (others => '0');			
+				when master_call   => 
+					if (cnt > delay_18_ms) then
+						cnt <= 0;
+						dataline_ctr <= "11"; -------------- data_line <= 'Z'
+						state <= master_wait;					
+					else 
+						cnt <= cnt + 1;
+						dataline_ctr <= "10"; ------------- data_line <= '0'
+						state <= master_call;
+					end if;			 
+				when master_wait => 
+					if (cnt >=  delay_20_us) then
+						cnt <= delay_20_us;
+						dataline_ctr <= "00";
+						state <= slave_response;
+--			
+					else
+						cnt <= cnt +1;
+						dataline_ctr <= "11";
+						state <= master_wait;
+					end if;
+				when slave_response => 
+					if (cnt >=  delay_80_us) then
+						dataline_ctr <= "00";
+						cnt <= delay_80_us;
+						if pre_signal_temp = '0' and pre_signal = '1' then
+							state <= slave_prepare;
+						else
+							state <= slave_response;
+						end if;
+					else
+						dataline_ctr <= "00";
+						cnt <= cnt +1;
+						state <= slave_response;
+					end if;
+				when slave_prepare   => 
+					if (cnt >=  delay_80_us) then
+						dataline_ctr <= "00";
+						cnt <= delay_80_us;
+						if pre_signal_temp = '1' and pre_signal = '0' then
+							state <= data_begin;
+						else
+							state <= slave_prepare;
+						end if;
+					else
+						dataline_ctr <= "00";
+						cnt <= cnt +1;
+						state <= slave_prepare;
+					end if;
+				when data_begin   => 
+					if(data_bit >1) then  -- if 40-bit data hasn't been fully transmitted.
+						dataline_ctr <= "00";
+						if (cnt >= delay_50_us) then  -- after 50us low voltage, start to tansmit 1-bit data
+							cnt <= delay_50_us;
+							if pre_signal_temp = '0' and pre_signal = '1' then
+								state <= data_read;
+							else
+								state <= data_begin;
+							end if;
+						else 
+							cnt <= cnt + 1;
+							state <= data_begin;							
+						end if;	
+					elsif(data_bit = 1) then
+						dataline_ctr <= "00";
+						state <= data_end;  -- if data bit counter already reached 40, go to the end state
+							
+					end if;
+				when data_read    =>  --if(data_line = '0') then  -- data line is low, start to transmit next bit data
+					dataline_ctr <= "00";	
+					if pre_signal_temp = '0' and pre_signal = '1' then
+						data_bit <= data_bit - 1;
+						if (cnt >= delay_50_us) then
+							tmp_get <= tmp_get(39 downto 1) & '1';
+						else
+							tmp_get <= tmp_get(39 downto 1) & '0';
+						end if;
+						cnt <= 0;
+						state <= data_begin;
+					else
+						cnt <= cnt +1;
+						state <= data_read;
+					end if;						 
+				when data_end    =>  --data_line <= '1';   -- pull up data line
+					dataline_ctr <= "00";
+					if (cnt >= delay_50_us) then
+						cnt <= delay_50_us;
+						if pre_signal_temp = '0' and pre_signal = '1' then
+							state <= initial;
+						else
+							state <= data_end;
+						end if;
+					else
+						cnt <= cnt +1;
+						state <= data_end;
+						humidity_tmp <= tmp_get(39 downto 32);
+						temperature_tmp <= tmp_get(23 downto 16);
+					end if;											
+		 	end case;
+		end if;
+	end process;
+	
+	process(dataline_ctr)
+	begin
+		if dataline_ctr(0) = '0' then
+			data_line_buffer <= '0';
+		elsif dataline_ctr(0) = '1' then
+			data_line_buffer <= '1';
+		end if;
+	end process;
+
+	data_line1 <= data_line_buffer when dataline_ctr(1)='1' else 'Z';
+	pre_signal <= data_line1;
+	
+	humidity <= humidity_tmp;
+	temperature <= temperature_tmp;
+	
+	
+	end Behavioral;
